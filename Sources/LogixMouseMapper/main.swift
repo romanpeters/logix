@@ -482,7 +482,7 @@ enum MappedAction: String, CaseIterable {
         case .missionControl:
             return "Mission Control"
         case .appExpose:
-            return "Application Windows (App Expose)"
+            return "App Expose"
         case .showDesktop:
             return "Show Desktop"
         case .moveSpaceLeft:
@@ -1037,7 +1037,7 @@ final class LearnButtonWindowController: NSWindowController, NSWindowDelegate {
             return
         }
 
-        let introLabel = NSTextField(labelWithString: "Press any mouse button or shortcut.")
+        let introLabel = NSTextField(labelWithString: "Press any mouse button.")
         introLabel.textColor = .secondaryLabelColor
 
         let nameLabel = NSTextField(labelWithString: "Name")
