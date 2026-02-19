@@ -9,6 +9,20 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:-}"
+VERSION_FILE="$ROOT_DIR/VERSION"
+
+APP_VERSION="${APP_VERSION:-}"
+if [[ -z "$APP_VERSION" && -f "$VERSION_FILE" ]]; then
+    APP_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+fi
+if [[ -z "$APP_VERSION" ]]; then
+    APP_VERSION="1.0.0"
+fi
+
+APP_BUILD="${APP_BUILD:-}"
+if [[ -z "$APP_BUILD" ]]; then
+    APP_BUILD="$(git -C "$ROOT_DIR" rev-list --count HEAD 2>/dev/null || echo 1)"
+fi
 
 swift build -c release
 
@@ -30,9 +44,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key>
     <string>com.logix.mousemapper</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>${APP_BUILD}</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleExecutable</key>
     <string>${APP_NAME}</string>
     <key>CFBundlePackageType</key>
