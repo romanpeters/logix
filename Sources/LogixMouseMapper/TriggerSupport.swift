@@ -114,18 +114,21 @@ struct ButtonEntry: Codable, Hashable {
     let id: String
     var name: String
     var trigger: ButtonTrigger
+    var requiresDoublePress: Bool
 
     private enum CodingKeys: String, CodingKey {
         case id
         case name
         case trigger
         case rawButton
+        case requiresDoublePress
     }
 
-    init(id: String, name: String, trigger: ButtonTrigger) {
+    init(id: String, name: String, trigger: ButtonTrigger, requiresDoublePress: Bool = false) {
         self.id = id
         self.name = name
         self.trigger = trigger
+        self.requiresDoublePress = requiresDoublePress
     }
 
     init(from decoder: Decoder) throws {
@@ -135,11 +138,13 @@ struct ButtonEntry: Codable, Hashable {
 
         if let trigger = try container.decodeIfPresent(ButtonTrigger.self, forKey: .trigger) {
             self.trigger = trigger
+            requiresDoublePress = try container.decodeIfPresent(Bool.self, forKey: .requiresDoublePress) ?? false
             return
         }
 
         if let rawButton = try container.decodeIfPresent(Int.self, forKey: .rawButton) {
             trigger = .mouseButton(rawButton)
+            requiresDoublePress = try container.decodeIfPresent(Bool.self, forKey: .requiresDoublePress) ?? false
             return
         }
 
@@ -155,6 +160,7 @@ struct ButtonEntry: Codable, Hashable {
         try container.encode(id, forKey: .id)
         try container.encode(name, forKey: .name)
         try container.encode(trigger, forKey: .trigger)
+        try container.encode(requiresDoublePress, forKey: .requiresDoublePress)
         if case .mouseButton(let rawButton) = trigger {
             try container.encode(rawButton, forKey: .rawButton)
         }
@@ -375,4 +381,3 @@ func triggerContainsPrimaryOrSecondaryClick(_ trigger: ButtonTrigger) -> Bool {
         return triggerContainsPrimaryOrSecondaryClick(first) || triggerContainsPrimaryOrSecondaryClick(second)
     }
 }
-

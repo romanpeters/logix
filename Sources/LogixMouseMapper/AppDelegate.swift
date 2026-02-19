@@ -1,10 +1,18 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import ServiceManagement
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private struct PendingSingleDispatch {
+        let entryID: String
+        let workItem: DispatchWorkItem
+        let createdTimestamp: UInt64
+    }
+
     private let mappingsKey = "ButtonMappings"
     private let entriesKey = "ButtonEntries"
+    private let releasesURLString = "https://github.com/romanpeters/logix/releases"
 
     private let menu = NSMenu()
     private var statusItem: NSStatusItem?
@@ -18,6 +26,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var menuIsOpen = false
     private var lastMappedDownTriggerKey: String?
     private var lastMappedDownTimestamp: UInt64 = 0
+    private var trackedModifierFlags: CGEventFlags = []
+    private var pendingShortcutKeyUps: [String: UInt64] = [:]
+    private var pendingDoublePressByEntryID: [String: UInt64] = [:]
+    private var pendingSingleDispatchByTriggerKey: [String: PendingSingleDispatch] = [:]
+    private var recentKeyEscapeSequence = ""
+    private var recentKeyEscapeSequenceTimestamp: UInt64 = 0
 
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
@@ -85,7 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
 
-        let titleItem = NSMenuItem(title: "Logix Button Mapper", action: nil, keyEquivalent: "")
+        let titleItem = NSMenuItem(title: "Logix \(appVersionString())", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
         menu.addItem(titleItem)
 
@@ -160,6 +174,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(startAtLoginItem)
         self.startAtLoginItem = startAtLoginItem
 
+        let updateItem = NSMenuItem(title: "Update", action: #selector(openUpdatesPage), keyEquivalent: "")
+        updateItem.target = self
+        menu.addItem(updateItem)
+
         let openAccessibilityItem = NSMenuItem(title: "Open Accessibility Settings", action: #selector(openAccessibilitySettings), keyEquivalent: "")
         openAccessibilityItem.target = self
         menu.addItem(openAccessibilityItem)
@@ -203,8 +221,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let controller = LearnButtonWindowController()
-        controller.onAdd = { [weak self] name, trigger in
-            self?.addButtonEntry(name: name, trigger: trigger)
+        controller.onAdd = { [weak self] name, trigger, requiresDoublePress in
+            self?.addButtonEntry(name: name, trigger: trigger, requiresDoublePress: requiresDoublePress)
         }
         controller.onClose = { [weak self] in
             self?.learnWindowController = nil
@@ -218,6 +236,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        pendingDoublePressByEntryID.removeValue(forKey: entryID)
+        for (triggerKey, pending) in pendingSingleDispatchByTriggerKey where pending.entryID == entryID {
+            pending.workItem.cancel()
+            pendingSingleDispatchByTriggerKey.removeValue(forKey: triggerKey)
+        }
         buttonEntries.removeAll { $0.id == entryID }
         buttonMappings.removeValue(forKey: entryID)
 
@@ -228,6 +251,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openAccessibilitySettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else {
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openUpdatesPage() {
+        guard let url = URL(string: releasesURLString) else {
             return
         }
         NSWorkspace.shared.open(url)
@@ -424,19 +454,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func sanitizeEntries(_ entries: [ButtonEntry]) -> [ButtonEntry] {
         var usedIDs: Set<String> = []
-        var usedTriggers: Set<ButtonTrigger> = []
+        var usedTriggerModes: Set<String> = []
+        var triggerCounts: [String: Int] = [:]
         var sanitized: [ButtonEntry] = []
 
         for entry in entries {
+            let triggerKey = entry.trigger.storageKey
+            let triggerModeKey = "\(triggerKey)|\(entry.requiresDoublePress)"
+            let triggerCount = triggerCounts[triggerKey, default: 0]
             guard !entry.id.isEmpty,
                   !entry.name.isEmpty,
                   isValidTrigger(entry.trigger),
                   !usedIDs.contains(entry.id),
-                  !usedTriggers.contains(entry.trigger) else {
+                  !usedTriggerModes.contains(triggerModeKey),
+                  triggerCount < 2 else {
                 continue
             }
             usedIDs.insert(entry.id)
-            usedTriggers.insert(entry.trigger)
+            usedTriggerModes.insert(triggerModeKey)
+            triggerCounts[triggerKey] = triggerCount + 1
             sanitized.append(entry)
         }
 
@@ -472,7 +508,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buttonEntries.first { $0.trigger == trigger }
     }
 
-    private func addButtonEntry(name: String, trigger: ButtonTrigger) {
+    private func buttonEntries(forTrigger trigger: ButtonTrigger) -> [ButtonEntry] {
+        buttonEntries.filter { $0.trigger == trigger }
+    }
+
+    private func addButtonEntry(name: String, trigger: ButtonTrigger, requiresDoublePress: Bool) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let finalName = trimmed.isEmpty ? trigger.fallbackName : trimmed
 
@@ -489,15 +529,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        if let existing = buttonEntries.first(where: { $0.trigger == trigger }) {
+        let matchingEntries = buttonEntries(forTrigger: trigger)
+        if let existing = matchingEntries.first(where: { $0.requiresDoublePress == requiresDoublePress }) {
+            let modeTitle = requiresDoublePress ? "double-click" : "single-click"
             showInfoAlert(
                 title: "Trigger Already Added",
-                message: "\(trigger.debugLabel) is already mapped as \"\(existing.name)\"."
+                message: "\(trigger.debugLabel) (\(modeTitle)) is already mapped as \"\(existing.name)\"."
+            )
+            return
+        }
+        if matchingEntries.count >= 2 {
+            showInfoAlert(
+                title: "Trigger Already Added",
+                message: "\(trigger.debugLabel) already has both single-click and double-click entries."
             )
             return
         }
 
-        let entry = ButtonEntry(id: UUID().uuidString, name: finalName, trigger: trigger)
+        let entry = ButtonEntry(
+            id: UUID().uuidString,
+            name: finalName,
+            trigger: trigger,
+            requiresDoublePress: requiresDoublePress
+        )
         buttonEntries.append(entry)
         buttonMappings[entry.id] = .passThrough
         saveButtonEntries()
@@ -518,6 +572,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func requestAccessibilityPrompt() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    private func appVersionString() -> String {
+        if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+           !version.isEmpty {
+            return version
+        }
+        if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+           !version.isEmpty {
+            return version
+        }
+        return "?"
     }
 
     private func startEventTap() {
@@ -568,6 +634,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         eventTapSource = nil
         eventTap = nil
+        clearPendingSingleDispatches()
+        trackedModifierFlags = []
+        pendingShortcutKeyUps = [:]
+        pendingDoublePressByEntryID = [:]
+        recentKeyEscapeSequence = ""
+        recentKeyEscapeSequenceTimestamp = 0
     }
 
     private func handleEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -575,10 +647,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let tap = eventTap {
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
+            clearPendingSingleDispatches()
+            trackedModifierFlags = []
+            pendingShortcutKeyUps = [:]
+            pendingDoublePressByEntryID = [:]
+            recentKeyEscapeSequence = ""
+            recentKeyEscapeSequenceTimestamp = 0
             return Unmanaged.passRetained(event)
         }
 
         let learningController = learnWindowController?.window?.isVisible == true ? learnWindowController : nil
+
+        if let learningController,
+           type == .keyDown,
+           Int(event.getIntegerValueField(.keyboardEventKeycode)) == Int(kVK_Escape) {
+            DispatchQueue.main.async {
+                learningController.window?.close()
+            }
+            return Unmanaged.passRetained(event)
+        }
 
         if let systemDefined = systemDefinedTrigger(from: event, type: type) {
             if let learningController {
@@ -590,7 +677,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         )
                     }
                 }
-                return nil
+                return Unmanaged.passRetained(event)
             }
 
             return routeMappedTriggerEvent(
@@ -613,7 +700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         learningController.updateCapturedMouseButton(rawButton: rawButton)
                     }
                 }
-                return nil
+                return Unmanaged.passRetained(event)
             }
 
             return routeMappedTriggerEvent(trigger: trigger, isDown: isMouseDownEvent(type), event: event)
@@ -621,12 +708,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if type == .keyDown || type == .keyUp {
             let keyCode = Int(event.getIntegerValueField(.keyboardEventKeycode))
-            let modifierFlags = normalizedShortcutModifierFlags(from: event.flags, keyCode: keyCode)
+            let isKeyDown = type == .keyDown
+            updateTrackedModifierFlags(for: keyCode, isDown: isKeyDown)
+            let effectiveFlags = mergedModifierFlags(with: event.flags)
+            let modifierFlags = normalizedShortcutModifierFlags(from: effectiveFlags, keyCode: keyCode)
             let shortcutTrigger = ButtonTrigger.syntheticShortcut(keyCode: keyCode, modifierFlags: modifierFlags)
             let isShortcutTrigger = shouldTreatKeyAsShortcutTrigger(
                 keyCode: keyCode,
                 modifierFlags: modifierFlags
             )
+            let fallbackTrigger = fallbackTriggerFromEscapeSequence(event: event, type: type)
 
             if let learningController {
                 if isShortcutTrigger && type == .keyDown {
@@ -637,18 +728,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         )
                     }
                 }
-
-                if isShortcutTrigger || !learningController.hasCapturedTrigger {
-                    return nil
+                if !isShortcutTrigger,
+                   let fallbackTrigger,
+                   type == .keyDown,
+                   case .syntheticShortcut(let fallbackKeyCode, let fallbackFlags) = fallbackTrigger {
+                    DispatchQueue.main.async {
+                        learningController.updateCapturedSyntheticShortcut(
+                            keyCode: fallbackKeyCode,
+                            modifierFlags: fallbackFlags
+                        )
+                    }
                 }
                 return Unmanaged.passRetained(event)
+            }
+
+            if isShortcutTrigger, buttonEntry(forTrigger: shortcutTrigger) != nil {
+                return routeMappedTriggerEvent(trigger: shortcutTrigger, isDown: isKeyDown, event: event)
+            }
+
+            if let fallbackTrigger, buttonEntry(forTrigger: fallbackTrigger) != nil {
+                return routeMappedTriggerEvent(trigger: fallbackTrigger, isDown: isKeyDown, event: event)
             }
 
             guard isShortcutTrigger else {
                 return Unmanaged.passRetained(event)
             }
 
-            return routeMappedTriggerEvent(trigger: shortcutTrigger, isDown: type == .keyDown, event: event)
+            return Unmanaged.passRetained(event)
         }
 
         return Unmanaged.passRetained(event)
@@ -660,6 +766,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func mask(forRawValue rawValue: UInt32) -> CGEventMask {
         CGEventMask(1) << rawValue
+    }
+
+    private func mergedModifierFlags(with eventFlags: CGEventFlags) -> CGEventFlags {
+        var merged = eventFlags
+        merged.formUnion(trackedModifierFlags)
+        return merged
+    }
+
+    private func updateTrackedModifierFlags(for keyCode: Int, isDown: Bool) {
+        guard let modifierFlag = modifierEventFlag(for: keyCode) else {
+            return
+        }
+
+        if isDown {
+            trackedModifierFlags.insert(modifierFlag)
+        } else {
+            trackedModifierFlags.remove(modifierFlag)
+        }
+    }
+
+    private func modifierEventFlag(for keyCode: Int) -> CGEventFlags? {
+        switch keyCode {
+        case Int(kVK_Command), Int(kVK_RightCommand):
+            return .maskCommand
+        case Int(kVK_Shift), Int(kVK_RightShift):
+            return .maskShift
+        case Int(kVK_Option), Int(kVK_RightOption):
+            return .maskAlternate
+        case Int(kVK_Control), Int(kVK_RightControl):
+            return .maskControl
+        case Int(kVK_Function):
+            return .maskSecondaryFn
+        default:
+            return nil
+        }
+    }
+
+    private func fallbackTriggerFromEscapeSequence(event: CGEvent, type: CGEventType) -> ButtonTrigger? {
+        guard type == .keyDown else {
+            return nil
+        }
+
+        let text = unicodeString(from: event)
+        guard !text.isEmpty else {
+            return nil
+        }
+
+        let resetWindowNanos: UInt64 = 250_000_000
+        if event.timestamp > recentKeyEscapeSequenceTimestamp,
+           (event.timestamp - recentKeyEscapeSequenceTimestamp) > resetWindowNanos {
+            recentKeyEscapeSequence = ""
+        }
+        recentKeyEscapeSequenceTimestamp = event.timestamp
+        recentKeyEscapeSequence += text
+        if recentKeyEscapeSequence.count > 48 {
+            recentKeyEscapeSequence = String(recentKeyEscapeSequence.suffix(48))
+        }
+
+        guard recentKeyEscapeSequence.hasSuffix(";9~")
+            || recentKeyEscapeSequence.hasSuffix("9~") else {
+            return nil
+        }
+
+        return .syntheticShortcut(
+            keyCode: Int(kVK_Tab),
+            modifierFlags: normalizedShortcutModifierFlags(from: .maskCommand, keyCode: Int(kVK_Tab))
+        )
+    }
+
+    private func unicodeString(from event: CGEvent) -> String {
+        var actualLength: Int = 0
+        var buffer = [UniChar](repeating: 0, count: 8)
+        event.keyboardGetUnicodeString(
+            maxStringLength: buffer.count,
+            actualStringLength: &actualLength,
+            unicodeString: &buffer
+        )
+        guard actualLength > 0 else {
+            return ""
+        }
+        return String(utf16CodeUnits: buffer, count: actualLength)
     }
 
     private func isMouseEvent(_ type: CGEventType) -> Bool {
@@ -683,17 +870,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return Unmanaged.passRetained(event)
         }
 
-        guard let entry = buttonEntry(forTrigger: trigger) else {
+        let matchingEntries = buttonEntries(forTrigger: trigger)
+        guard !matchingEntries.isEmpty else {
+            return Unmanaged.passRetained(event)
+        }
+
+        let activeEntries = matchingEntries.filter { mappedAction(for: $0) != .passThrough }
+        guard !activeEntries.isEmpty else {
+            return Unmanaged.passRetained(event)
+        }
+
+        if let singleEntry = activeEntries.first(where: { !$0.requiresDoublePress }),
+           let doubleEntry = activeEntries.first(where: { $0.requiresDoublePress }) {
+            return routeDualModeTrigger(
+                trigger: trigger,
+                singleEntry: singleEntry,
+                doubleEntry: doubleEntry,
+                isDown: isDown,
+                event: event
+            )
+        }
+
+        guard let selectedEntry = activeEntries.first else {
             return Unmanaged.passRetained(event)
         }
 
         if isDown {
             DispatchQueue.main.async { [weak self] in
-                self?.flashButtonHighlight(entryID: entry.id)
+                self?.flashButtonHighlight(entryID: selectedEntry.id)
             }
         }
 
-        return runMappedAction(for: entry, isDown: isDown, event: event)
+        return runMappedAction(for: selectedEntry, isDown: isDown, event: event)
+    }
+
+    private func routeDualModeTrigger(
+        trigger: ButtonTrigger,
+        singleEntry: ButtonEntry,
+        doubleEntry: ButtonEntry,
+        isDown: Bool,
+        event: CGEvent
+    ) -> Unmanaged<CGEvent>? {
+        let shouldProcessNow = shouldPerformMappedAction(for: trigger, isDown: isDown, timestamp: event.timestamp)
+        guard shouldProcessNow else {
+            return nil
+        }
+
+        let triggerKey = trigger.storageKey
+        purgeExpiredPendingSingleDispatches(referenceTimestamp: event.timestamp)
+
+        if let pending = pendingSingleDispatchByTriggerKey[triggerKey] {
+            pending.workItem.cancel()
+            pendingSingleDispatchByTriggerKey.removeValue(forKey: triggerKey)
+            DispatchQueue.main.async { [weak self] in
+                self?.flashButtonHighlight(entryID: doubleEntry.id)
+            }
+            _ = performMappedActionNow(for: doubleEntry, timestamp: event.timestamp)
+            return nil
+        }
+
+        let scheduledTimestamp = event.timestamp
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else {
+                return
+            }
+            guard let pending = self.pendingSingleDispatchByTriggerKey[triggerKey],
+                  pending.entryID == singleEntry.id else {
+                return
+            }
+            self.pendingSingleDispatchByTriggerKey.removeValue(forKey: triggerKey)
+            _ = self.performMappedActionNow(for: singleEntry, timestamp: scheduledTimestamp)
+        }
+        pendingSingleDispatchByTriggerKey[triggerKey] = PendingSingleDispatch(
+            entryID: singleEntry.id,
+            workItem: workItem,
+            createdTimestamp: event.timestamp
+        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
+        return nil
     }
 
     private func runMappedAction(for entry: ButtonEntry, isDown: Bool, event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -701,22 +955,132 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return Unmanaged.passRetained(event)
         }
 
-        let action = buttonMappings[entry.id] ?? .passThrough
+        let action = mappedAction(for: entry)
         switch action {
         case .passThrough:
             return Unmanaged.passRetained(event)
         case .disabled:
             return nil
         default:
-            if isDown {
-                let triggerKey = entry.trigger.storageKey
-                if shouldSuppressDuplicateMappedPress(triggerKey: triggerKey, timestamp: event.timestamp) {
+            if shouldPerformMappedAction(for: entry.trigger, isDown: isDown, timestamp: event.timestamp) {
+                if !shouldPassDoublePressRequirement(for: entry, timestamp: event.timestamp) {
                     return nil
                 }
-                action.perform()
-                recordMappedPress(triggerKey: triggerKey, timestamp: event.timestamp)
+                _ = performMappedActionNow(for: entry, timestamp: event.timestamp)
             }
             return nil
+        }
+    }
+
+    private func mappedAction(for entry: ButtonEntry) -> MappedAction {
+        buttonMappings[entry.id] ?? .passThrough
+    }
+
+    @discardableResult
+    private func performMappedActionNow(for entry: ButtonEntry, timestamp: UInt64) -> Bool {
+        let action = mappedAction(for: entry)
+        switch action {
+        case .passThrough:
+            return false
+        case .disabled:
+            return true
+        default:
+            let triggerKey = entry.trigger.storageKey
+            if shouldApplyDuplicateSuppression(for: entry.trigger),
+               shouldSuppressDuplicateMappedPress(triggerKey: triggerKey, timestamp: timestamp) {
+                return true
+            }
+            action.perform()
+            recordMappedPress(triggerKey: triggerKey, timestamp: timestamp)
+            return true
+        }
+    }
+
+    private func shouldPassDoublePressRequirement(for entry: ButtonEntry, timestamp: UInt64) -> Bool {
+        purgeExpiredDoublePressCandidates(referenceTimestamp: timestamp)
+
+        guard entry.requiresDoublePress else {
+            pendingDoublePressByEntryID.removeValue(forKey: entry.id)
+            return true
+        }
+
+        let thresholdNanos: UInt64 = 500_000_000
+        if let firstTimestamp = pendingDoublePressByEntryID[entry.id],
+           timestamp >= firstTimestamp,
+           (timestamp - firstTimestamp) <= thresholdNanos {
+            pendingDoublePressByEntryID.removeValue(forKey: entry.id)
+            return true
+        }
+
+        pendingDoublePressByEntryID[entry.id] = timestamp
+        return false
+    }
+
+    private func purgeExpiredDoublePressCandidates(referenceTimestamp: UInt64) {
+        let expirationNanos: UInt64 = 2_000_000_000
+        pendingDoublePressByEntryID = pendingDoublePressByEntryID.filter { (_, firstTimestamp) in
+            referenceTimestamp >= firstTimestamp && (referenceTimestamp - firstTimestamp) <= expirationNanos
+        }
+    }
+
+    private func clearPendingSingleDispatches() {
+        for pending in pendingSingleDispatchByTriggerKey.values {
+            pending.workItem.cancel()
+        }
+        pendingSingleDispatchByTriggerKey.removeAll()
+    }
+
+    private func purgeExpiredPendingSingleDispatches(referenceTimestamp: UInt64) {
+        let expirationNanos: UInt64 = 2_000_000_000
+        for (triggerKey, pending) in pendingSingleDispatchByTriggerKey {
+            if referenceTimestamp < pending.createdTimestamp
+                || (referenceTimestamp - pending.createdTimestamp) > expirationNanos {
+                pending.workItem.cancel()
+                pendingSingleDispatchByTriggerKey.removeValue(forKey: triggerKey)
+            }
+        }
+    }
+
+    private func shouldPerformMappedAction(for trigger: ButtonTrigger, isDown: Bool, timestamp: UInt64) -> Bool {
+        let triggerKey = trigger.storageKey
+        purgeExpiredPendingShortcutKeyUps(referenceTimestamp: timestamp)
+
+        switch trigger {
+        case .mouseButton:
+            return isDown
+        case .syntheticShortcut:
+            if isDown {
+                pendingShortcutKeyUps[triggerKey] = timestamp
+                return true
+            }
+
+            if let downTimestamp = pendingShortcutKeyUps[triggerKey],
+               timestamp >= downTimestamp,
+               (timestamp - downTimestamp) <= 700_000_000 {
+                pendingShortcutKeyUps.removeValue(forKey: triggerKey)
+                return false
+            }
+
+            pendingShortcutKeyUps.removeValue(forKey: triggerKey)
+            return true
+        case .combo:
+            return false
+        }
+    }
+
+    private func purgeExpiredPendingShortcutKeyUps(referenceTimestamp: UInt64) {
+        let expirationNanos: UInt64 = 2_000_000_000
+        pendingShortcutKeyUps = pendingShortcutKeyUps.filter { (_, downTimestamp) in
+            referenceTimestamp >= downTimestamp && (referenceTimestamp - downTimestamp) <= expirationNanos
+        }
+    }
+
+    private func shouldApplyDuplicateSuppression(for trigger: ButtonTrigger) -> Bool {
+        switch trigger {
+        case .mouseButton:
+            return true
+        case .syntheticShortcut, .combo:
+            return false
         }
     }
 
@@ -763,4 +1127,3 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastMappedDownTimestamp = timestamp
     }
 }
-

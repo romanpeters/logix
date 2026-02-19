@@ -2,12 +2,13 @@ import AppKit
 import Carbon.HIToolbox
 
 final class LearnButtonWindowController: NSWindowController, NSWindowDelegate {
-    var onAdd: ((String, ButtonTrigger) -> Void)?
+    var onAdd: ((String, ButtonTrigger, Bool) -> Void)?
     var onClose: (() -> Void)?
     var hasCapturedTrigger: Bool { resolvedTrigger != nil }
 
     private let pressedLabel = NSTextField(labelWithString: "Pressed event: none")
     private let nameField = NSTextField()
+    private let doublePressToggle = NSButton(checkboxWithTitle: "Double click", target: nil, action: nil)
     private let addButton = NSButton(title: "Add Entry", target: nil, action: nil)
     private var capturedTrigger: ButtonTrigger?
     private var escapeKeyMonitor: Any?
@@ -85,7 +86,7 @@ final class LearnButtonWindowController: NSWindowController, NSWindowDelegate {
         buttonRow.alignment = .centerY
 
         let stack = NSStackView(
-            views: [introLabel, pressedLabel, nameLabel, nameField, buttonRow]
+            views: [introLabel, pressedLabel, doublePressToggle, nameLabel, nameField, buttonRow]
         )
         stack.orientation = .vertical
         stack.spacing = 10
@@ -118,7 +119,7 @@ final class LearnButtonWindowController: NSWindowController, NSWindowDelegate {
         }
         let trimmed = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let name = trimmed.isEmpty ? trigger.fallbackName : trimmed
-        onAdd?(name, trigger)
+        onAdd?(name, trigger, doublePressToggle.state == .on)
         closeWindow()
     }
 
