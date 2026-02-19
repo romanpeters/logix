@@ -1220,14 +1220,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let title = NSMutableAttributedString(
                 string: "L",
                 attributes: [
-                    .font: NSFont.systemFont(ofSize: 14, weight: .regular),
-                    .baselineOffset: 1
+                    .font: NSFont.systemFont(ofSize: 13, weight: .light),
+                    .baselineOffset: 2,
+                    .kern: -2
                 ]
             )
             title.append(
                 NSAttributedString(
-                    string: "x",
-                    attributes: [
+                        string: "x",
+                        attributes: [
                         .font: NSFont.systemFont(ofSize: 9, weight: .regular),
                         .baselineOffset: -2
                     ]
