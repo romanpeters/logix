@@ -976,7 +976,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                shouldSuppressDuplicateMappedPress(triggerKey: triggerKey, timestamp: timestamp) {
                 return true
             }
-            action.perform()
+            action.perform(entryName: entry.name)
             recordMappedPress(triggerKey: triggerKey, timestamp: timestamp)
             return true
         }

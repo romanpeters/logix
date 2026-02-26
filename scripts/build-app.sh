@@ -2,6 +2,7 @@
 set -euo pipefail
 
 APP_NAME="LogixMouseMapper"
+BUNDLE_ID="com.logix.mousemapper"
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$ROOT_DIR/.build/release"
 APP_DIR="$ROOT_DIR/dist/${APP_NAME}.app"
@@ -9,6 +10,7 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:-}"
+RESET_ACCESSIBILITY="${RESET_ACCESSIBILITY:-1}"
 VERSION_FILE="$ROOT_DIR/VERSION"
 
 APP_VERSION="${APP_VERSION:-}"
@@ -42,7 +44,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key>
     <string>${APP_NAME}</string>
     <key>CFBundleIdentifier</key>
-    <string>com.logix.mousemapper</string>
+    <string>${BUNDLE_ID}</string>
     <key>CFBundleVersion</key>
     <string>${APP_BUILD}</string>
     <key>CFBundleShortVersionString</key>
@@ -65,6 +67,11 @@ if [[ -n "$SIGNING_IDENTITY" ]]; then
     codesign --force --deep --sign "$SIGNING_IDENTITY" "$APP_DIR"
 else
     codesign --force --deep --sign - "$APP_DIR"
+fi
+
+if [[ "$RESET_ACCESSIBILITY" == "1" ]] && command -v tccutil >/dev/null 2>&1; then
+    tccutil reset Accessibility "$BUNDLE_ID" >/dev/null 2>&1 || true
+    echo "Reset Accessibility permission entry for $BUNDLE_ID"
 fi
 
 echo "Built $APP_DIR"

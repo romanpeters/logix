@@ -10,6 +10,7 @@ struct ActionSection {
 enum MappedAction: String, CaseIterable {
     case passThrough
     case disabled
+    case runShortcutByName
 
     case missionControl
     case appExpose
@@ -40,6 +41,7 @@ enum MappedAction: String, CaseIterable {
     case selectAll
     case find
     case emojiPicker
+    case hyperKey
     case escape
     case returnKey
     case tabKey
@@ -65,7 +67,7 @@ enum MappedAction: String, CaseIterable {
     static let menuSections: [ActionSection] = [
         ActionSection(
             title: "Basic",
-            actions: [.passThrough, .disabled]
+            actions: [.passThrough, .disabled, .runShortcutByName]
         ),
         ActionSection(
             title: "Desktop & Windows",
@@ -85,7 +87,7 @@ enum MappedAction: String, CaseIterable {
             title: "Editing & Keys",
             actions: [
                 .copy, .paste, .cut, .undo, .redo, .selectAll, .find,
-                .emojiPicker, .escape, .returnKey, .tabKey,
+                .emojiPicker, .hyperKey, .escape, .returnKey, .tabKey,
                 .pageUp, .pageDown, .home, .end, .deleteBackward, .deleteForward
             ]
         ),
@@ -105,6 +107,8 @@ enum MappedAction: String, CaseIterable {
             return "Pass Through (Default)"
         case .disabled:
             return "Disabled"
+        case .runShortcutByName:
+            return "Run Shortcut"
         case .missionControl:
             return "Mission Control"
         case .appExpose:
@@ -159,6 +163,8 @@ enum MappedAction: String, CaseIterable {
             return "Find"
         case .emojiPicker:
             return "Emoji Picker"
+        case .hyperKey:
+            return "Hyper Key (Ctrl+Option+Cmd+Shift)"
         case .escape:
             return "Escape"
         case .returnKey:
@@ -200,10 +206,12 @@ enum MappedAction: String, CaseIterable {
         }
     }
 
-    func perform() {
+    func perform(entryName: String) {
         switch self {
         case .passThrough, .disabled:
             return
+        case .runShortcutByName:
+            runShortcutByName(entryName)
         case .missionControl:
             postConfiguredSymbolicHotKey(
                 id: 32,
@@ -287,6 +295,8 @@ enum MappedAction: String, CaseIterable {
             postKeyPress(keyCode: CGKeyCode(kVK_ANSI_F), flags: .maskCommand)
         case .emojiPicker:
             postKeyPress(keyCode: CGKeyCode(kVK_Space), flags: [.maskCommand, .maskControl])
+        case .hyperKey:
+            postHyperKeyTap()
         case .escape:
             postKeyPress(keyCode: CGKeyCode(kVK_Escape), flags: [])
         case .returnKey:
@@ -325,6 +335,107 @@ enum MappedAction: String, CaseIterable {
             postKeyPress(keyCode: CGKeyCode(kVK_Space), flags: .maskCommand)
         case .siri:
             triggerSiri()
+        }
+    }
+
+    private func runShortcutByName(_ entryName: String) {
+        let shortcutName = entryName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !shortcutName.isEmpty else {
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard FileManager.default.isExecutableFile(atPath: "/usr/bin/shortcuts") else {
+                self.presentMissingShortcutAlert(shortcutName)
+                return
+            }
+
+            guard self.shortcutExists(named: shortcutName) else {
+                self.presentMissingShortcutAlert(shortcutName)
+                return
+            }
+
+            _ = self.runShortcut(named: shortcutName)
+        }
+    }
+
+    private func shortcutExists(named name: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/shortcuts")
+        process.arguments = ["list"]
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return false
+        }
+
+        guard process.terminationStatus == 0 else {
+            return false
+        }
+
+        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else {
+            return false
+        }
+        let listed = output
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        return listed.contains(name)
+    }
+
+    private func runShortcut(named name: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/shortcuts")
+        process.arguments = ["run", name]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private func presentMissingShortcutAlert(_ shortcutName: String) {
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "Shortcut Not Found"
+            alert.informativeText = "Create a shortcut named \"\(shortcutName)\" in Apple Shortcuts. This mapping runs a shortcut with the same name as the entry."
+            alert.addButton(withTitle: "Open Shortcuts")
+            alert.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                self.openShortcutsApp(prefillName: shortcutName)
+            }
+        }
+    }
+
+    private func openShortcutsApp(prefillName: String) {
+        let workspace = NSWorkspace.shared
+        let encodedName = prefillName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? prefillName
+        let candidates = [
+            "shortcuts://create-shortcut?name=\(encodedName)",
+            "shortcuts://create-shortcut",
+            "shortcuts://"
+        ]
+        for candidate in candidates {
+            if let url = URL(string: candidate), workspace.open(url) {
+                return
+            }
+        }
+
+        if let appURL = workspace.urlForApplication(withBundleIdentifier: "com.apple.shortcuts") {
+            let config = NSWorkspace.OpenConfiguration()
+            config.activates = true
+            workspace.openApplication(at: appURL, configuration: config) { _, _ in }
         }
     }
 
@@ -525,6 +636,17 @@ enum MappedAction: String, CaseIterable {
         postMediaKeyEvent(keyType: keyType, isDown: false)
     }
 
+    private func postHyperKeyTap() {
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            return
+        }
+
+        let hyperFlags: CGEventFlags = [.maskControl, .maskAlternate, .maskCommand, .maskShift]
+        let activeModifiers = postModifierEvents(flags: hyperFlags, keyDown: true, source: source)
+        usleep(12_000)
+        postModifierKeyUps(activeModifiers, source: source)
+    }
+
     private func postMediaKeyEvent(keyType: Int32, isDown: Bool) {
         let keyState: Int32 = isDown ? 0xA : 0xB
         let data1 = Int((keyType << 16) | (keyState << 8))
@@ -596,4 +718,3 @@ enum MappedAction: String, CaseIterable {
         postModifierKeyUps(activeModifiers, source: source)
     }
 }
-
