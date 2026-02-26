@@ -66,26 +66,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            let title = NSMutableAttributedString(
-                string: "L",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 13, weight: .light),
-                    .baselineOffset: 2,
-                    .kern: -2
-                ]
-            )
-            title.append(
-                NSAttributedString(
-                        string: "x",
-                        attributes: [
-                        .font: NSFont.systemFont(ofSize: 9, weight: .regular),
-                        .baselineOffset: -2
-                    ]
-                )
-            )
-            button.attributedTitle = title
-            button.image = nil
-            button.imagePosition = .noImage
+            button.title = ""
+            button.imagePosition = .imageOnly
+            if let image = NSImage(systemSymbolName: "computermouse", accessibilityDescription: "Logix") {
+                image.isTemplate = true
+                button.image = image
+            }
             button.toolTip = "MX Master Mapper"
         }
         item.menu = menu
